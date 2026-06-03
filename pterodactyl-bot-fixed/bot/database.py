@@ -321,6 +321,103 @@ class Database:
     async def list_admins(self) -> list[aiosqlite.Row]:
         return await self.fetchall("SELECT * FROM admins ORDER BY added_at")
 
+    # ── Log Channel (MISSING METHOD #1-2) ───────────────────────────────────
+
+    async def set_log_channel(self, channel_id: int) -> None:
+        """Set the Discord channel ID for bot action logs."""
+        await self.execute(
+            "INSERT OR REPLACE INTO log_channel (id, channel_id) VALUES (1, ?)",
+            (channel_id,),
+        )
+        log.info("Set log channel to %d", channel_id)
+
+    async def get_log_channel(self) -> int | None:
+        """Get the Discord channel ID for bot action logs."""
+        row = await self.fetchone("SELECT channel_id FROM log_channel WHERE id = 1")
+        return row["channel_id"] if row else None
+
+    # ── Maintenance Channels (MISSING METHOD #3-4) ───────────────────────────
+
+    async def set_maintenance_channel(self, channel_id: int) -> None:
+        """Add a channel to receive maintenance alerts."""
+        await self.execute(
+            "INSERT OR IGNORE INTO maintenance_channels (channel_id) VALUES (?)",
+            (channel_id,),
+        )
+        log.info("Added maintenance channel %d", channel_id)
+
+    async def get_maintenance_channels(self) -> list[aiosqlite.Row]:
+        """Get all maintenance alert channels."""
+        return await self.fetchall("SELECT channel_id FROM maintenance_channels")
+
+    # ── Node Status Messages (MISSING METHODS #5-7) ──────────────────────────
+
+    async def get_node_status_msg(
+        self, node_id: int, channel_id: int
+    ) -> aiosqlite.Row | None:
+        """Get stored node status message ID for a node+channel pair."""
+        return await self.fetchone(
+            "SELECT * FROM node_status_messages WHERE node_id = ? AND channel_id = ?",
+            (node_id, channel_id),
+        )
+
+    async def upsert_node_status_msg(
+        self, node_id: int, channel_id: int, message_id: int
+    ) -> None:
+        """Create or update node status message record."""
+        await self.execute(
+            """INSERT OR REPLACE INTO node_status_messages
+               (node_id, channel_id, message_id)
+               VALUES (?,?,?)""",
+            (node_id, channel_id, message_id),
+        )
+
+    async def get_node_status_msgs(self) -> list[aiosqlite.Row]:
+        """Get all stored node status messages."""
+        return await self.fetchall("SELECT * FROM node_status_messages")
+
+    # ── Node Uptime Messages (MISSING METHODS #8-9) ───────────────────────────
+
+    async def get_uptime_msgs(self) -> list[aiosqlite.Row]:
+        """Get all stored uptime overview messages."""
+        return await self.fetchall("SELECT * FROM node_uptime_messages")
+
+    async def upsert_uptime_msg(self, channel_id: int, message_id: int) -> None:
+        """Create or update uptime message record."""
+        await self.execute(
+            """INSERT OR REPLACE INTO node_uptime_messages
+               (channel_id, message_id)
+               VALUES (?,?)""",
+            (channel_id, message_id),
+        )
+
+    # ── Maintenance Messages (MISSING METHODS #10-12) ───────────────────────
+
+    async def upsert_maintenance_msg(
+        self, node_id: int, channel_id: int, message_id: int
+    ) -> None:
+        """Create or update maintenance alert message record."""
+        await self.execute(
+            """INSERT OR REPLACE INTO maintenance_messages
+               (node_id, channel_id, message_id)
+               VALUES (?,?,?)""",
+            (node_id, channel_id, message_id),
+        )
+
+    async def get_maintenance_msg(self, node_id: int) -> aiosqlite.Row | None:
+        """Get stored maintenance message for a node."""
+        return await self.fetchone(
+            "SELECT * FROM maintenance_messages WHERE node_id = ?",
+            (node_id,),
+        )
+
+    async def delete_maintenance_msg(self, node_id: int) -> None:
+        """Delete maintenance message record for a node."""
+        await self.execute(
+            "DELETE FROM maintenance_messages WHERE node_id = ?",
+            (node_id,),
+        )
+
     # ── Free Hosting Stock Management ────────────────────────────────────
 
     async def create_stock_plan(

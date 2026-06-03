@@ -1,0 +1,21 @@
+# Pterodactyl Discord Bot — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# Discord
+discord.py==2.3.2
+
+# Async HTTP (Pterodactyl API calls)
+aiohttp==3.9.5
+
+# Async SQLite
+aiosqlite==0.20.0
+
+# Environment variable loading
+python-dotenv==1.0.1
+
+# Optional: PostgreSQL support (uncomment if using Postgres instead of SQLite)
+# asyncpg==0.29.0
+# SQLAlchemy[asyncio]==2.0.30
+
+# Optional: better logging
+# structlog==24.1.0

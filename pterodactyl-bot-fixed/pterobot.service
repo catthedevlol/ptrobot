@@ -1,0 +1,24 @@
+[Unit]
+Description=Pterodactyl Discord Bot
+After=network.target
+
+[Service]
+Type=simple
+User=pterobot
+WorkingDirectory=/opt/pterobot/bot
+ExecStart=/opt/pterobot/venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/opt/pterobot/.env
+
+# Resource limits
+LimitNOFILE=65535
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/pterobot/bot/data
+
+[Install]
+WantedBy=multi-user.target

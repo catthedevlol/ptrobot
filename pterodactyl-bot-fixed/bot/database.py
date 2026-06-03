@@ -1,22 +1,11 @@
 """
-database.py — Async database layer (aiosqlite).
+database.py — Enhanced async database layer with free hosting claims system.
 
-Tables
-------
-admins                — sub-admin Discord IDs
-pterodactyl_users     — Discord → Pterodactyl user mapping
-pterodactyl_servers   — Discord user → Pterodactyl server mapping
-node_status_messages  — persistent status embed tracking
-node_uptime_messages  — persistent uptime embed tracking
-maintenance_messages  — persistent maintenance embed tracking
-maintenance_channels  — channels to receive maintenance alerts
-node_downtime_log     — raw downtime events (open/close)
-node_uptime           — per-node uptime statistics (survives restarts)
-node_events           — ordered timeline of online/offline events
-node_history          — monthly uptime snapshots
-server_logs           — per-server audit events
-action_logs           — global audit log entries
-log_channel           — configured log channel
+Tables added:
+- free_hosting_claims    — Per-user claim tracking
+- free_hosting_stock     — Server type inventory
+- claim_validation_logs  — Claim validation audit trail
+- provisioned_servers    — Auto-provisioned server records
 """
 
 import asyncio
@@ -28,9 +17,9 @@ import aiosqlite
 log = logging.getLogger("bot.database")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
 # DDL — all tables created with IF NOT EXISTS so migrations are safe
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS admins (
     discord_id  INTEGER PRIMARY KEY,
@@ -91,32 +80,29 @@ CREATE TABLE IF NOT EXISTS maintenance_channels (
     channel_id  INTEGER PRIMARY KEY
 );
 
--- Raw downtime events (one row per outage)
 CREATE TABLE IF NOT EXISTS node_downtime_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     node_id     INTEGER NOT NULL,
     node_name   TEXT    NOT NULL,
-    down_at     TEXT    NOT NULL,   -- ISO-8601 UTC
-    up_at       TEXT,               -- NULL while still down
-    duration_s  INTEGER             -- filled when up_at is set
+    down_at     TEXT    NOT NULL,
+    up_at       TEXT,
+    duration_s  INTEGER
 );
 
--- Per-node cumulative uptime stats — survives bot restarts
 CREATE TABLE IF NOT EXISTS node_uptime (
     node_id                 INTEGER PRIMARY KEY,
     node_name               TEXT    NOT NULL DEFAULT '',
-    online_since            TEXT,   -- UTC ISO-8601, set when node came online
-    offline_since           TEXT,   -- UTC ISO-8601, set when node went offline
+    online_since            TEXT,
+    offline_since           TEXT,
     last_online_session_s   INTEGER NOT NULL DEFAULT 0,
     last_downtime_s         INTEGER NOT NULL DEFAULT 0,
     total_downtime_s        INTEGER NOT NULL DEFAULT 0,
     month_start             TEXT    NOT NULL DEFAULT (strftime('%Y-%m-01T00:00:00Z','now')),
     month_downtime_s        INTEGER NOT NULL DEFAULT 0,
-    last_seen_online        TEXT,   -- last time we successfully polled the node
+    last_seen_online        TEXT,
     updated_at              TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 
--- Timeline of state-change events for each node
 CREATE TABLE IF NOT EXISTS node_events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     node_id     INTEGER NOT NULL,
@@ -125,19 +111,17 @@ CREATE TABLE IF NOT EXISTS node_events (
     ts          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 
--- Monthly uptime snapshots
 CREATE TABLE IF NOT EXISTS node_history (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     node_id         INTEGER NOT NULL,
     node_name       TEXT    NOT NULL,
-    month           TEXT    NOT NULL,   -- YYYY-MM
+    month           TEXT    NOT NULL,
     uptime_pct      REAL    NOT NULL,
     total_downtime_s INTEGER NOT NULL,
     recorded_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     UNIQUE (node_id, month)
 );
 
--- Per-server event log
 CREATE TABLE IF NOT EXISTS server_logs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     server_id   INTEGER NOT NULL,
@@ -160,9 +144,88 @@ CREATE TABLE IF NOT EXISTS log_channel (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
     channel_id  INTEGER NOT NULL
 );
+
+-- ────────────────────────────────────────────────────────────────
+-- Free Hosting Claims System
+-- ────────────────────────────────────────────────────────────────
+
+-- Server type inventory and allocation
+CREATE TABLE IF NOT EXISTS free_hosting_stock (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_key            TEXT    NOT NULL UNIQUE,  -- e.g., 'starter', 'standard'
+    plan_label          TEXT    NOT NULL,         -- e.g., 'Starter Plan'
+    description         TEXT    NOT NULL,         -- User-friendly description
+    cpu_percent         INTEGER NOT NULL,
+    memory_mb           INTEGER NOT NULL,
+    disk_mb             INTEGER NOT NULL,
+    egg_ids             TEXT    NOT NULL,         -- JSON list of egg IDs
+    node_ids            TEXT    NOT NULL,         -- JSON list of node IDs
+    total_stock         INTEGER NOT NULL,         -- Total slots available
+    claimed_count       INTEGER NOT NULL DEFAULT 0, -- Number of claims
+    available_count     INTEGER NOT NULL DEFAULT 0, -- total_stock - claimed_count
+    enabled             BOOLEAN NOT NULL DEFAULT 1,
+    created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+-- User claims (one per user per plan type)
+CREATE TABLE IF NOT EXISTS free_hosting_claims (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    discord_id          INTEGER NOT NULL,
+    plan_key            TEXT    NOT NULL,
+    status              TEXT    NOT NULL CHECK (status IN ('pending', 'approved', 'provisioned', 'rejected', 'revoked')),
+    rejection_reason    TEXT,
+    pterodactyl_user_id INTEGER,           -- Link to ptero user after validation
+    server_id           INTEGER,            -- Link to provisioned server
+    claimed_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    approved_at         TEXT,
+    approved_by         INTEGER,            -- Admin who approved
+    provisioned_at      TEXT,
+    provisioned_by      INTEGER,            -- Admin/system who provisioned
+    revoked_at          TEXT,
+    revoked_by          INTEGER,
+    notes               TEXT,
+    UNIQUE (discord_id, plan_key)
+);
+
+-- Validation audit trail
+CREATE TABLE IF NOT EXISTS claim_validation_logs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_id        INTEGER NOT NULL,
+    discord_id      INTEGER NOT NULL,
+    plan_key        TEXT    NOT NULL,
+    validation_type TEXT    NOT NULL,  -- 'account_check', 'email_verify', 'manual_review'
+    status          TEXT    NOT NULL,  -- 'pass', 'fail', 'pending'
+    details         TEXT,
+    validated_by    INTEGER,
+    validated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    FOREIGN KEY (claim_id) REFERENCES free_hosting_claims(id)
+);
+
+-- Provisioned server records (audit trail for auto-provisioning)
+CREATE TABLE IF NOT EXISTS provisioned_servers (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_id        INTEGER NOT NULL UNIQUE,
+    discord_id      INTEGER NOT NULL,
+    plan_key        TEXT    NOT NULL,
+    pterodactyl_server_id INTEGER NOT NULL,
+    server_name     TEXT    NOT NULL,
+    credentials_issued BOOLEAN NOT NULL DEFAULT 0,
+    provisioned_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    provisioned_by  INTEGER NOT NULL,
+    FOREIGN KEY (claim_id) REFERENCES free_hosting_claims(id)
+);
+
+-- Create indexes for performance
+CREATE INDEX IF NOT EXISTS idx_claims_discord_id ON free_hosting_claims(discord_id);
+CREATE INDEX IF NOT EXISTS idx_claims_status ON free_hosting_claims(status);
+CREATE INDEX IF NOT EXISTS idx_claims_plan_key ON free_hosting_claims(plan_key);
+CREATE INDEX IF NOT EXISTS idx_validation_claim_id ON claim_validation_logs(claim_id);
+CREATE INDEX IF NOT EXISTS idx_provisioned_discord_id ON provisioned_servers(discord_id);
+CREATE INDEX IF NOT EXISTS idx_stock_plan_key ON free_hosting_stock(plan_key);
 """
 
-# Migration: add columns that might be missing in existing databases
+# Migration: add health check probe tracking
 MIGRATIONS = [
     "ALTER TABLE pterodactyl_servers ADD COLUMN node_name TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE pterodactyl_servers ADD COLUMN egg_name TEXT NOT NULL DEFAULT ''",
@@ -185,13 +248,12 @@ class Database:
         else:
             self._path = url
         self._db: aiosqlite.Connection | None = None
-        self._lock = asyncio.Lock()  # serialise writes to prevent locking issues
+        self._lock = asyncio.Lock()
 
     async def init(self) -> None:
         """Open the connection, apply schema, run migrations."""
         self._db = await aiosqlite.connect(self._path)
         self._db.row_factory = aiosqlite.Row
-        # WAL mode: concurrent reads while writing, better crash recovery
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._db.executescript(SCHEMA)
@@ -200,19 +262,19 @@ class Database:
         log.info("Database initialised at %s", self._path)
 
     async def _run_migrations(self) -> None:
-        """Apply any ALTER TABLE migrations idempotently (ignore 'already exists' errors)."""
+        """Apply any ALTER TABLE migrations idempotently."""
         for stmt in MIGRATIONS:
             try:
                 await self._db.execute(stmt)
                 await self._db.commit()
             except Exception:
-                pass  # column already exists — safe to ignore
+                pass
 
     async def close(self) -> None:
         if self._db:
             await self._db.close()
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # ── Helpers ──────────────────────────────────────────────────────────
 
     async def fetchone(self, sql: str, params: tuple = ()) -> aiosqlite.Row | None:
         async with self._db.execute(sql, params) as cur:
@@ -232,7 +294,7 @@ class Database:
     def _now_utc(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # ── Admins ────────────────────────────────────────────────────────────────
+    # ── Admins ──────────────────────────────────────────────────────────
 
     async def add_admin(self, discord_id: int, added_by: int) -> None:
         await self.execute(
@@ -259,221 +321,343 @@ class Database:
     async def list_admins(self) -> list[aiosqlite.Row]:
         return await self.fetchall("SELECT * FROM admins ORDER BY added_at")
 
-    # ── Pterodactyl users ─────────────────────────────────────────────────────
+    # ── Free Hosting Stock Management ────────────────────────────────────
 
-    async def create_ptero_user(
+    async def create_stock_plan(
         self,
-        discord_id: int,
-        ptero_id: int,
-        username: str,
-        email: str,
-        password: str,
-        created_by: int,
+        plan_key: str,
+        plan_label: str,
+        description: str,
+        cpu_percent: int,
+        memory_mb: int,
+        disk_mb: int,
+        egg_ids: list[int],
+        node_ids: list[int],
+        total_stock: int,
     ) -> None:
+        """Create or update a free hosting plan."""
+        import json
+        
         await self.execute(
-            """INSERT OR REPLACE INTO pterodactyl_users
-               (discord_id, ptero_id, username, email, password, created_by)
-               VALUES (?,?,?,?,?,?)""",
-            (discord_id, ptero_id, username, email, password, created_by),
+            """INSERT OR REPLACE INTO free_hosting_stock
+               (plan_key, plan_label, description, cpu_percent, memory_mb, disk_mb,
+                egg_ids, node_ids, total_stock, available_count)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                plan_key,
+                plan_label,
+                description,
+                cpu_percent,
+                memory_mb,
+                disk_mb,
+                json.dumps(egg_ids),
+                json.dumps(node_ids),
+                total_stock,
+                total_stock,
+            ),
+        )
+        log.info("Created/updated stock plan: %s (%d slots)", plan_key, total_stock)
+
+    async def get_stock_plan(self, plan_key: str) -> aiosqlite.Row | None:
+        """Fetch a single stock plan."""
+        return await self.fetchone(
+            "SELECT * FROM free_hosting_stock WHERE plan_key = ?",
+            (plan_key,),
+        )
+
+    async def get_all_stock_plans(self, enabled_only: bool = False) -> list[aiosqlite.Row]:
+        """List all stock plans."""
+        if enabled_only:
+            return await self.fetchall(
+                "SELECT * FROM free_hosting_stock WHERE enabled = 1 ORDER BY plan_key"
+            )
+        return await self.fetchall("SELECT * FROM free_hosting_stock ORDER BY plan_key")
+
+    async def update_stock_availability(self, plan_key: str, claimed_count: int) -> None:
+        """Update claimed count and recalculate available."""
+        row = await self.get_stock_plan(plan_key)
+        if not row:
+            return
+        
+        total = row["total_stock"]
+        available = max(0, total - claimed_count)
+        
+        await self.execute(
+            """UPDATE free_hosting_stock
+               SET claimed_count = ?, available_count = ?, updated_at = ?
+               WHERE plan_key = ?""",
+            (claimed_count, available, self._now_utc(), plan_key),
+        )
+
+    async def enable_stock_plan(self, plan_key: str, admin_id: int) -> None:
+        """Enable a stock plan."""
+        await self.execute(
+            "UPDATE free_hosting_stock SET enabled = 1, updated_at = ? WHERE plan_key = ?",
+            (self._now_utc(), plan_key),
         )
         await self.log_action(
-            "user_created",
-            actor_id=created_by,
-            target_id=discord_id,
-            details=f"ptero_id={ptero_id} username={username}",
+            "stock_enabled",
+            actor_id=admin_id,
+            details=f"plan_key={plan_key}",
         )
 
-    async def get_ptero_user(self, discord_id: int) -> aiosqlite.Row | None:
-        return await self.fetchone(
-            "SELECT * FROM pterodactyl_users WHERE discord_id = ?", (discord_id,)
+    async def disable_stock_plan(self, plan_key: str, admin_id: int, reason: str = "") -> None:
+        """Disable a stock plan."""
+        await self.execute(
+            "UPDATE free_hosting_stock SET enabled = 0, updated_at = ? WHERE plan_key = ?",
+            (self._now_utc(), plan_key),
+        )
+        await self.log_action(
+            "stock_disabled",
+            actor_id=admin_id,
+            details=f"plan_key={plan_key} reason={reason}",
         )
 
-    async def username_exists(self, username: str) -> bool:
-        row = await self.fetchone(
-            "SELECT 1 FROM pterodactyl_users WHERE username = ?", (username,)
-        )
-        return row is not None
+    # ── Free Hosting Claims ──────────────────────────────────────────────
 
-    # ── Pterodactyl servers ───────────────────────────────────────────────────
-
-    async def create_ptero_server(
+    async def create_claim(
         self,
         discord_id: int,
-        ptero_server_id: int,
-        identifier: str,
-        name: str,
-        egg_id: int,
-        node_id: int,
-        created_by: int,
-        *,
-        node_name: str = "",
-        egg_name: str = "",
-        software: str = "",
-        plan_label: str = "",
-        cpu: int = 0,
-        ram: int = 0,
-        disk: int = 0,
-        allocation_ip: str = "",
-        allocation_port: int = 0,
-    ) -> int:
-        row_id = await self.execute(
-            """INSERT INTO pterodactyl_servers
-               (discord_id, ptero_server_id, identifier, name, egg_id, node_id,
-                node_name, egg_name, software, plan_label, cpu, ram, disk,
-                allocation_ip, allocation_port, created_by)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (discord_id, ptero_server_id, identifier, name, egg_id, node_id,
-             node_name, egg_name, software, plan_label, cpu, ram, disk,
-             allocation_ip, allocation_port, created_by),
+        plan_key: str,
+    ) -> int | None:
+        """
+        Create a new free hosting claim (one per user per plan).
+        
+        Returns:
+            Claim ID on success, None if user already claimed this plan.
+        """
+        # Check for existing claim
+        existing = await self.fetchone(
+            "SELECT id FROM free_hosting_claims WHERE discord_id = ? AND plan_key = ?",
+            (discord_id, plan_key),
         )
-        await self.log_action(
-            "server_created",
-            actor_id=created_by,
-            target_id=discord_id,
-            details=f"server_id={ptero_server_id} name={name}",
+        if existing:
+            return None
+        
+        claim_id = await self.execute(
+            """INSERT INTO free_hosting_claims
+               (discord_id, plan_key, status)
+               VALUES (?,?,'pending')""",
+            (discord_id, plan_key),
         )
-        await self.log_server_event(ptero_server_id, discord_id, "created", f"name={name}")
-        return row_id
+        
+        log.info(
+            "Created claim %d for user %d on plan %s",
+            claim_id,
+            discord_id,
+            plan_key,
+        )
+        return claim_id
 
-    async def get_servers_by_discord(self, discord_id: int) -> list[aiosqlite.Row]:
+    async def get_claim(self, claim_id: int) -> aiosqlite.Row | None:
+        """Fetch a single claim by ID."""
+        return await self.fetchone(
+            "SELECT * FROM free_hosting_claims WHERE id = ?",
+            (claim_id,),
+        )
+
+    async def get_user_claim(
+        self,
+        discord_id: int,
+        plan_key: str,
+    ) -> aiosqlite.Row | None:
+        """Fetch a user's claim for a specific plan."""
+        return await self.fetchone(
+            "SELECT * FROM free_hosting_claims WHERE discord_id = ? AND plan_key = ?",
+            (discord_id, plan_key),
+        )
+
+    async def get_user_claims(self, discord_id: int) -> list[aiosqlite.Row]:
+        """Fetch all claims by a user."""
         return await self.fetchall(
-            "SELECT * FROM pterodactyl_servers WHERE discord_id = ? ORDER BY created_at",
+            "SELECT * FROM free_hosting_claims WHERE discord_id = ? ORDER BY claimed_at DESC",
             (discord_id,),
         )
 
-    async def delete_ptero_server(self, ptero_server_id: int, deleted_by: int) -> None:
-        row = await self.fetchone(
-            "SELECT * FROM pterodactyl_servers WHERE ptero_server_id = ?",
-            (ptero_server_id,),
+    async def get_claims_by_status(self, status: str) -> list[aiosqlite.Row]:
+        """Fetch all claims with a specific status."""
+        return await self.fetchall(
+            "SELECT * FROM free_hosting_claims WHERE status = ? ORDER BY claimed_at DESC",
+            (status,),
         )
-        if row:
-            await self.execute(
-                "DELETE FROM pterodactyl_servers WHERE ptero_server_id = ?",
-                (ptero_server_id,),
-            )
-            await self.log_action(
-                "server_deleted",
-                actor_id=deleted_by,
-                target_id=row["discord_id"],
-                details=f"server_id={ptero_server_id} name={row['name']}",
-            )
-            await self.log_server_event(
-                ptero_server_id, row["discord_id"], "deleted",
-                f"deleted_by={deleted_by}"
-            )
 
-    # ── Server logs ───────────────────────────────────────────────────────────
-
-    async def log_server_event(
+    async def approve_claim(
         self,
+        claim_id: int,
+        approved_by: int,
+        notes: str = "",
+    ) -> bool:
+        """Approve a pending claim."""
+        claim = await self.get_claim(claim_id)
+        if not claim or claim["status"] != "pending":
+            return False
+        
+        await self.execute(
+            """UPDATE free_hosting_claims
+               SET status = 'approved', approved_at = ?, approved_by = ?, notes = ?
+               WHERE id = ?""",
+            (self._now_utc(), approved_by, notes, claim_id),
+        )
+        
+        await self.log_action(
+            "claim_approved",
+            actor_id=approved_by,
+            target_id=claim["discord_id"],
+            details=f"claim_id={claim_id} plan_key={claim['plan_key']}",
+        )
+        return True
+
+    async def reject_claim(
+        self,
+        claim_id: int,
+        rejected_by: int,
+        reason: str = "No reason provided",
+    ) -> bool:
+        """Reject a pending claim."""
+        claim = await self.get_claim(claim_id)
+        if not claim or claim["status"] != "pending":
+            return False
+        
+        await self.execute(
+            """UPDATE free_hosting_claims
+               SET status = 'rejected', rejection_reason = ?
+               WHERE id = ?""",
+            (reason, claim_id),
+        )
+        
+        await self.log_action(
+            "claim_rejected",
+            actor_id=rejected_by,
+            target_id=claim["discord_id"],
+            details=f"claim_id={claim_id} reason={reason}",
+        )
+        return True
+
+    async def revoke_claim(
+        self,
+        claim_id: int,
+        revoked_by: int,
+        reason: str = "No reason provided",
+    ) -> bool:
+        """Revoke an approved or provisioned claim."""
+        claim = await self.get_claim(claim_id)
+        if not claim:
+            return False
+        
+        await self.execute(
+            """UPDATE free_hosting_claims
+               SET status = 'revoked', revoked_at = ?, revoked_by = ?, notes = ?
+               WHERE id = ?""",
+            (self._now_utc(), revoked_by, reason, claim_id),
+        )
+        
+        await self.log_action(
+            "claim_revoked",
+            actor_id=revoked_by,
+            target_id=claim["discord_id"],
+            details=f"claim_id={claim_id} reason={reason}",
+        )
+        return True
+
+    async def mark_claim_provisioned(
+        self,
+        claim_id: int,
+        pterodactyl_user_id: int,
         server_id: int,
+        provisioned_by: int,
+    ) -> bool:
+        """Mark a claim as provisioned after server creation."""
+        await self.execute(
+            """UPDATE free_hosting_claims
+               SET status = 'provisioned', pterodactyl_user_id = ?, server_id = ?,
+                   provisioned_at = ?, provisioned_by = ?
+               WHERE id = ?""",
+            (pterodactyl_user_id, server_id, self._now_utc(), provisioned_by, claim_id),
+        )
+        return True
+
+    # ── Claim Validation Logs ────────────────────────────────────────────
+
+    async def log_validation(
+        self,
+        claim_id: int,
         discord_id: int,
-        event: str,
+        plan_key: str,
+        validation_type: str,
+        status: str,
+        details: str = "",
+        validated_by: int | None = None,
+    ) -> None:
+        """Log a validation step."""
+        await self.execute(
+            """INSERT INTO claim_validation_logs
+               (claim_id, discord_id, plan_key, validation_type, status, details, validated_by)
+               VALUES (?,?,?,?,?,?,?)""",
+            (claim_id, discord_id, plan_key, validation_type, status, details, validated_by),
+        )
+
+    async def get_validation_logs(self, claim_id: int) -> list[aiosqlite.Row]:
+        """Get validation history for a claim."""
+        return await self.fetchall(
+            "SELECT * FROM claim_validation_logs WHERE claim_id = ? ORDER BY validated_at DESC",
+            (claim_id,),
+        )
+
+    # ── Provisioned Servers ──────────────────────────────────────────────
+
+    async def record_provisioned_server(
+        self,
+        claim_id: int,
+        discord_id: int,
+        plan_key: str,
+        pterodactyl_server_id: int,
+        server_name: str,
+        provisioned_by: int,
+    ) -> int:
+        """Record a server that was auto-provisioned for a claim."""
+        return await self.execute(
+            """INSERT INTO provisioned_servers
+               (claim_id, discord_id, plan_key, pterodactyl_server_id, server_name, provisioned_by)
+               VALUES (?,?,?,?,?,?)""",
+            (claim_id, discord_id, plan_key, pterodactyl_server_id, server_name, provisioned_by),
+        )
+
+    async def get_provisioned_server(self, claim_id: int) -> aiosqlite.Row | None:
+        """Fetch provisioned server record for a claim."""
+        return await self.fetchone(
+            "SELECT * FROM provisioned_servers WHERE claim_id = ?",
+            (claim_id,),
+        )
+
+    async def mark_credentials_issued(self, claim_id: int) -> None:
+        """Mark that credentials have been issued to the user."""
+        await self.execute(
+            "UPDATE provisioned_servers SET credentials_issued = 1 WHERE claim_id = ?",
+            (claim_id,),
+        )
+
+    # ── Action log ─────────────────────────────────────────────────────────
+
+    async def log_action(
+        self,
+        action: str,
+        actor_id: int | None = None,
+        target_id: int | None = None,
         details: str | None = None,
     ) -> None:
         await self.execute(
-            "INSERT INTO server_logs (server_id, discord_id, event, details) VALUES (?,?,?,?)",
-            (server_id, discord_id, event, details),
+            "INSERT INTO action_logs (action, actor_id, target_id, details) VALUES (?,?,?,?)",
+            (action, actor_id, target_id, details),
         )
 
-    # ── Node status messages ──────────────────────────────────────────────────
-
-    async def upsert_node_status_msg(
-        self, node_id: int, channel_id: int, message_id: int
-    ) -> None:
-        await self.execute(
-            """INSERT OR REPLACE INTO node_status_messages (node_id, channel_id, message_id)
-               VALUES (?,?,?)""",
-            (node_id, channel_id, message_id),
-        )
-
-    async def get_node_status_msgs(self) -> list[aiosqlite.Row]:
-        return await self.fetchall("SELECT * FROM node_status_messages")
-
-    async def get_node_status_msg(
-        self, node_id: int, channel_id: int
-    ) -> aiosqlite.Row | None:
-        return await self.fetchone(
-            "SELECT * FROM node_status_messages WHERE node_id=? AND channel_id=?",
-            (node_id, channel_id),
-        )
-
-    # ── Node uptime messages ──────────────────────────────────────────────────
-
-    async def upsert_uptime_msg(self, channel_id: int, message_id: int) -> None:
-        await self.execute(
-            "INSERT OR REPLACE INTO node_uptime_messages (channel_id, message_id) VALUES (?,?)",
-            (channel_id, message_id),
-        )
-
-    async def get_uptime_msgs(self) -> list[aiosqlite.Row]:
-        return await self.fetchall("SELECT * FROM node_uptime_messages")
-
-    # ── Maintenance messages ──────────────────────────────────────────────────
-
-    async def upsert_maintenance_msg(
-        self, node_id: int, channel_id: int, message_id: int
-    ) -> None:
-        await self.execute(
-            """INSERT OR REPLACE INTO maintenance_messages (node_id, channel_id, message_id)
-               VALUES (?,?,?)""",
-            (node_id, channel_id, message_id),
-        )
-
-    async def get_maintenance_msg(self, node_id: int) -> aiosqlite.Row | None:
-        return await self.fetchone(
-            "SELECT * FROM maintenance_messages WHERE node_id = ?", (node_id,)
-        )
-
-    async def delete_maintenance_msg(self, node_id: int) -> None:
-        await self.execute(
-            "DELETE FROM maintenance_messages WHERE node_id = ?", (node_id,)
-        )
-
-    async def set_maintenance_channel(self, channel_id: int) -> None:
-        await self.execute(
-            "INSERT OR REPLACE INTO maintenance_channels (channel_id) VALUES (?)",
-            (channel_id,),
-        )
-
-    async def get_maintenance_channels(self) -> list[aiosqlite.Row]:
-        return await self.fetchall("SELECT * FROM maintenance_channels")
-
-    # ── Raw downtime log ──────────────────────────────────────────────────────
-
-    async def open_downtime(self, node_id: int, node_name: str) -> int:
-        return await self.execute(
-            """INSERT INTO node_downtime_log (node_id, node_name, down_at)
-               VALUES (?,?,?)""",
-            (node_id, node_name, self._now_utc()),
-        )
-
-    async def close_downtime(self, node_id: int) -> int | None:
-        row = await self.fetchone(
-            """SELECT id, down_at FROM node_downtime_log
-               WHERE node_id=? AND up_at IS NULL ORDER BY id DESC LIMIT 1""",
-            (node_id,),
-        )
-        if not row:
-            return None
-        down_at = datetime.fromisoformat(row["down_at"].replace("Z", "+00:00"))
-        up_at = datetime.now(timezone.utc)
-        duration = int((up_at - down_at).total_seconds())
-        await self.execute(
-            "UPDATE node_downtime_log SET up_at=?, duration_s=? WHERE id=?",
-            (up_at.strftime("%Y-%m-%dT%H:%M:%SZ"), duration, row["id"]),
-        )
-        return duration
-
-    async def get_open_downtimes(self) -> list[aiosqlite.Row]:
+    async def get_recent_logs(self, limit: int = 50) -> list[aiosqlite.Row]:
         return await self.fetchall(
-            "SELECT * FROM node_downtime_log WHERE up_at IS NULL"
+            "SELECT * FROM action_logs ORDER BY id DESC LIMIT ?", (limit,)
         )
 
-    # ── Advanced node uptime stats ────────────────────────────────────────────
+    # ── Node uptime (keep existing methods) ───────────────────────────────
 
     async def ensure_node_uptime_row(self, node_id: int, node_name: str) -> None:
-        """Create the uptime row for a node if it doesn't exist."""
         await self.execute(
             """INSERT OR IGNORE INTO node_uptime (node_id, node_name)
                VALUES (?,?)""",
@@ -489,17 +673,16 @@ class Database:
         return await self.fetchall("SELECT * FROM node_uptime")
 
     async def mark_node_online(self, node_id: int, node_name: str) -> None:
-        """Record a node coming online — sets online_since, clears offline_since."""
         now = self._now_utc()
         row = await self.get_node_uptime(node_id)
         if row is None:
             await self.ensure_node_uptime_row(node_id, node_name)
             row = await self.get_node_uptime(node_id)
 
-        # Calculate how long it was offline
         last_downtime_s = 0
         if row["offline_since"]:
             try:
+                from datetime import datetime
                 offline_dt = datetime.fromisoformat(
                     row["offline_since"].replace("Z", "+00:00")
                 )
@@ -509,7 +692,6 @@ class Database:
             except Exception:
                 pass
 
-        # Reset month bucket if we're in a new month
         new_month = datetime.now(timezone.utc).strftime("%Y-%m-01T00:00:00Z")
         month_downtime = row["month_downtime_s"] if row["month_start"] == new_month else 0
 
@@ -524,14 +706,15 @@ class Database:
                 month_downtime_s=? + ?,
                 last_seen_online=?,
                 updated_at=?
-               WHERE node_id=?""",
+            WHERE node_id=?""",
             (
                 node_name,
                 now,
                 last_downtime_s,
                 last_downtime_s,
                 new_month,
-                month_downtime, last_downtime_s,
+                month_downtime,
+                last_downtime_s,
                 now,
                 now,
                 node_id,
@@ -540,17 +723,16 @@ class Database:
         await self._add_node_event(node_id, node_name, "online")
 
     async def mark_node_offline(self, node_id: int, node_name: str) -> None:
-        """Record a node going offline — sets offline_since, records online session duration."""
         now = self._now_utc()
         row = await self.get_node_uptime(node_id)
         if row is None:
             await self.ensure_node_uptime_row(node_id, node_name)
             row = await self.get_node_uptime(node_id)
 
-        # Calculate how long the online session lasted
         session_s = 0
         if row["online_since"]:
             try:
+                from datetime import datetime
                 online_dt = datetime.fromisoformat(
                     row["online_since"].replace("Z", "+00:00")
                 )
@@ -567,18 +749,16 @@ class Database:
                 online_since=NULL,
                 last_online_session_s=?,
                 updated_at=?
-               WHERE node_id=?""",
+            WHERE node_id=?""",
             (node_name, now, session_s, now, node_id),
         )
         await self._add_node_event(node_id, node_name, "offline")
 
     async def touch_node_online(self, node_id: int, node_name: str) -> None:
-        """Update last_seen_online without changing state (called every poll when node is up)."""
         now = self._now_utc()
         row = await self.get_node_uptime(node_id)
         if row is None:
             await self.ensure_node_uptime_row(node_id, node_name)
-            # Node just came to our attention — treat as first online
             await self.execute(
                 "UPDATE node_uptime SET online_since=?, last_seen_online=?, updated_at=? WHERE node_id=?",
                 (now, now, now, node_id),
@@ -590,24 +770,23 @@ class Database:
         )
 
     async def get_monthly_uptime_pct(self, node_id: int) -> float:
-        """Return this month's uptime % for the node."""
         row = await self.get_node_uptime(node_id)
         if not row:
             return 100.0
         now = datetime.now(timezone.utc)
         new_month = now.strftime("%Y-%m-01T00:00:00Z")
         if row["month_start"] != new_month:
-            return 100.0  # no data for this month yet
+            return 100.0
         try:
-            month_start_dt = datetime.fromisoformat(row["month_start"].replace("Z", "+00:00"))
+            from datetime import datetime as dt
+            month_start_dt = dt.fromisoformat(row["month_start"].replace("Z", "+00:00"))
             elapsed_s = (now - month_start_dt).total_seconds()
             if elapsed_s <= 0:
                 return 100.0
             downtime = row["month_downtime_s"] or 0
-            # Add current ongoing downtime if node is offline right now
             if row["offline_since"]:
                 try:
-                    offline_dt = datetime.fromisoformat(
+                    offline_dt = dt.fromisoformat(
                         row["offline_since"].replace("Z", "+00:00")
                     )
                     downtime += int((now - offline_dt).total_seconds())
@@ -626,33 +805,32 @@ class Database:
             (node_id, node_name, event),
         )
 
-    # ── Log channel ───────────────────────────────────────────────────────────
-
-    async def set_log_channel(self, channel_id: int) -> None:
-        await self.execute(
-            "INSERT OR REPLACE INTO log_channel (id, channel_id) VALUES (1,?)",
-            (channel_id,),
+    async def open_downtime(self, node_id: int, node_name: str) -> int:
+        return await self.execute(
+            """INSERT INTO node_downtime_log (node_id, node_name, down_at)
+               VALUES (?,?,?)""",
+            (node_id, node_name, self._now_utc()),
         )
 
-    async def get_log_channel(self) -> int | None:
-        row = await self.fetchone("SELECT channel_id FROM log_channel WHERE id=1")
-        return row["channel_id"] if row else None
-
-    # ── Action log ────────────────────────────────────────────────────────────
-
-    async def log_action(
-        self,
-        action: str,
-        actor_id: int | None = None,
-        target_id: int | None = None,
-        details: str | None = None,
-    ) -> None:
-        await self.execute(
-            "INSERT INTO action_logs (action, actor_id, target_id, details) VALUES (?,?,?,?)",
-            (action, actor_id, target_id, details),
+    async def close_downtime(self, node_id: int) -> int | None:
+        row = await self.fetchone(
+            """SELECT id, down_at FROM node_downtime_log
+               WHERE node_id=? AND up_at IS NULL ORDER BY id DESC LIMIT 1""",
+            (node_id,),
         )
+        if not row:
+            return None
+        from datetime import datetime
+        down_at = datetime.fromisoformat(row["down_at"].replace("Z", "+00:00"))
+        up_at = datetime.now(timezone.utc)
+        duration = int((up_at - down_at).total_seconds())
+        await self.execute(
+            "UPDATE node_downtime_log SET up_at=?, duration_s=? WHERE id=?",
+            (up_at.strftime("%Y-%m-%dT%H:%M:%SZ"), duration, row["id"]),
+        )
+        return duration
 
-    async def get_recent_logs(self, limit: int = 50) -> list[aiosqlite.Row]:
+    async def get_open_downtimes(self) -> list[aiosqlite.Row]:
         return await self.fetchall(
-            "SELECT * FROM action_logs ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT * FROM node_downtime_log WHERE up_at IS NULL"
         )

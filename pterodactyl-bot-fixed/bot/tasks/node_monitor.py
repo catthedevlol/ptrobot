@@ -1,15 +1,13 @@
 """
-tasks/node_monitor.py — Background task cog.
+tasks/node_monitor.py — Background task cog with real offline detection.
 
-Fixes applied:
-- True Wings-level offline detection (not just API availability).
-- Node state persisted in DB — survives bot restarts.
-- State loaded from DB on startup so transitions aren't replayed wrongly.
-- Advanced uptime tracking: online_since, offline_since, session durations,
-  total_downtime, monthly uptime %.
-- Status embeds updated immediately on every poll cycle.
-- Last-checked timestamp shown on every embed.
-- Stale "online forever" bug fixed: online flag comes from Wings health check.
+PHASE 2 FIXES:
+- Real Wings probing (TCP + HTTP dual-check)
+- Configurable offline/recovery thresholds
+- State persistence survives bot restarts
+- Maintenance alerts with proper recovery handling
+- No fake online status
+- Accurate color-coded embeds (RED/GREEN based on real state)
 """
 
 from __future__ import annotations
@@ -21,10 +19,10 @@ import discord
 from discord.ext import commands, tasks
 
 from utils.ptero_api import PterodactylAPI, PterodactylError, NodeStats
+from utils.node_checker import NodeChecker
 from utils.helpers import (
     fmt_bytes,
     fmt_duration,
-    fmt_ago,
     progress_bar,
     GREEN,
     RED,
@@ -41,10 +39,19 @@ log = logging.getLogger("bot.task.node_monitor")
 _node_was_online: dict[int, bool] = {}
 _state_loaded: bool = False
 
+# Offline detection thresholds (configurable)
+# A node is marked OFFLINE only after N consecutive failed checks
+OFFLINE_THRESHOLD = 3  # 3 consecutive failures = offline (45s with 15s interval)
+RECOVERY_THRESHOLD = 2  # 2 consecutive successes = online (30s recovery time)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# Track consecutive failures per node
+_consecutive_failures: dict[int, int] = {}
+_consecutive_successes: dict[int, int] = {}
+
+
+# ────────────────────────────────────────────────────────────────
 # Embed builders
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
 
 def _build_status_embed(stats: NodeStats, panel_url: str) -> discord.Embed:
     """Build the per-node live-status embed."""
@@ -63,6 +70,7 @@ def _build_status_embed(stats: NodeStats, panel_url: str) -> discord.Embed:
     embed.add_field(name="Status", value=status_icon, inline=True)
 
     if stats.online:
+        # Only show resource metrics if actually online
         ram_bar = progress_bar(stats.memory_used, stats.memory_total)
         disk_bar = progress_bar(stats.disk_used, stats.disk_total)
         embed.add_field(
@@ -86,8 +94,8 @@ def _build_status_embed(stats: NodeStats, panel_url: str) -> discord.Embed:
         embed.add_field(
             name="⚠️ Wings Unreachable",
             value=(
-                "The Wings daemon is not responding.\n"
-                "The node may be offline or under maintenance."
+                "The Wings daemon is not responding to health checks.\n"
+                "The node is offline or experiencing network issues."
             ),
             inline=False,
         )
@@ -198,31 +206,35 @@ def _build_recovery_embed(node_name: str, downtime_s: int) -> discord.Embed:
     return embed
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
 # Cog
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
 
 class NodeMonitorTask(commands.Cog):
-    """Background cog that keeps node embeds up-to-date."""
+    """Background cog that keeps node embeds up-to-date with REAL offline detection."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self._api: PterodactylAPI | None = None
+        self._checker: NodeChecker | None = None
 
-    # ── Cog lifecycle ──────────────────────────────────────────────────────────
+    # ── Cog lifecycle ────────────────────────────────────────────────────────
 
     async def cog_load(self) -> None:
         self._api = PterodactylAPI(
             self.bot.config.PANEL_URL,
             self.bot.config.PANEL_API_KEY,
         )
+        self._checker = NodeChecker()
         self.monitor_loop.change_interval(
             seconds=self.bot.config.NODE_POLL_INTERVAL
         )
         self.monitor_loop.start()
         log.info(
-            "NodeMonitorTask started (interval=%ds)",
+            "NodeMonitorTask started (interval=%ds, offline_threshold=%d, recovery_threshold=%d)",
             self.bot.config.NODE_POLL_INTERVAL,
+            OFFLINE_THRESHOLD,
+            RECOVERY_THRESHOLD,
         )
 
     async def cog_unload(self) -> None:
@@ -230,7 +242,7 @@ class NodeMonitorTask(commands.Cog):
         if self._api:
             await self._api.close()
 
-    # ── Main loop ──────────────────────────────────────────────────────────────
+    # ── Main loop ─────────────────────────────────────────────────────────
 
     @tasks.loop(seconds=45)
     async def monitor_loop(self) -> None:
@@ -241,6 +253,7 @@ class NodeMonitorTask(commands.Cog):
             log.error("monitor_loop unhandled error: %s", exc, exc_info=True)
 
     async def _run_cycle(self) -> None:
+        """Single monitoring cycle: probe nodes, handle transitions, update embeds."""
         global _state_loaded
 
         db = self.bot.db
@@ -257,26 +270,83 @@ class NodeMonitorTask(commands.Cog):
             log.warning("Could not list nodes: %s", exc)
             return
 
-        # Poll each node for live Wings status
+        # Real Wings probing for each node — use threshold-based logic
         online_map: dict[int, bool] = {}
         stats_map: dict[int, NodeStats | None] = {}
 
         for node in nodes:
             nid = node["id"]
-            try:
-                stats = await self._api.get_node_stats(nid)
-                stats_map[nid] = stats
-                online_map[nid] = stats.online
-            except PterodactylError as exc:
-                log.warning("Node %d stat fetch failed: %s", nid, exc)
-                stats_map[nid] = None
-                online_map[nid] = False
-            except Exception as exc:
-                log.error("Unexpected error polling node %d: %s", nid, exc)
-                stats_map[nid] = None
-                online_map[nid] = False
+            
+            # Use NodeChecker for real Wings probing
+            check_result = await self._checker.check_node(node)
+            is_online = check_result.online
+            
+            # Update failure/success counters
+            if is_online:
+                _consecutive_failures[nid] = 0
+                _consecutive_successes[nid] = _consecutive_successes.get(nid, 0) + 1
+            else:
+                _consecutive_successes[nid] = 0
+                _consecutive_failures[nid] = _consecutive_failures.get(nid, 0) + 1
 
-        # Handle state transitions first (writes to DB)
+            # Apply thresholds: only mark online/offline after N consecutive checks
+            threshold_online = _consecutive_successes.get(nid, 0) >= RECOVERY_THRESHOLD
+            threshold_offline = _consecutive_failures.get(nid, 0) >= OFFLINE_THRESHOLD
+
+            # Determine actual state based on thresholds
+            if threshold_offline and _consecutive_failures[nid] >= OFFLINE_THRESHOLD:
+                online_map[nid] = False
+            elif threshold_online and _consecutive_successes[nid] >= RECOVERY_THRESHOLD:
+                online_map[nid] = True
+            else:
+                # Still in threshold accumulation phase — keep previous state
+                online_map[nid] = _node_was_online.get(nid, True)
+
+            # Build stats for embed display
+            if online_map[nid]:
+                # Node online — get real resource metrics
+                try:
+                    stats = await self._api.get_node_stats(nid)
+                    stats_map[nid] = stats
+                except PterodactylError as exc:
+                    log.warning("Could not get stats for node %d: %s", nid, exc)
+                    # Build offline placeholder
+                    stats_map[nid] = NodeStats(
+                        node_id=nid,
+                        name=node["name"],
+                        online=False,
+                        memory_total=node.get("memory", 0),
+                        memory_used=0,
+                        disk_total=node.get("disk", 0),
+                        disk_used=0,
+                        cpu_count=node.get("cpu", 0),
+                        allocated_resources={},
+                        uptime=None,
+                    )
+            else:
+                # Node offline — build placeholder
+                stats_map[nid] = NodeStats(
+                    node_id=nid,
+                    name=node["name"],
+                    online=False,
+                    memory_total=node.get("memory", 0),
+                    memory_used=0,
+                    disk_total=node.get("disk", 0),
+                    disk_used=0,
+                    cpu_count=node.get("cpu", 0),
+                    allocated_resources={},
+                    uptime=None,
+                )
+
+            log.debug(
+                "[Monitor] %s: failures=%d, successes=%d, online=%s",
+                node["name"],
+                _consecutive_failures.get(nid, 0),
+                _consecutive_successes.get(nid, 0),
+                online_map[nid],
+            )
+
+        # Handle state transitions (offline → online, online → offline)
         await self._handle_transitions(nodes, online_map)
 
         # Refresh embeds with the latest data
@@ -294,7 +364,7 @@ class NodeMonitorTask(commands.Cog):
 
         await self._refresh_uptime_embeds(nodes, online_map, uptime_rows, monthly_pcts)
 
-    # ── State loader ───────────────────────────────────────────────────────────
+    # ── State loader ────────────────────────────────────────────────────────
 
     async def _load_state_from_db(self) -> None:
         """Populate _node_was_online from persisted uptime rows."""
@@ -308,7 +378,7 @@ class NodeMonitorTask(commands.Cog):
             {k: ("online" if v else "offline") for k, v in _node_was_online.items()},
         )
 
-    # ── Status embeds ──────────────────────────────────────────────────────────
+    # ── Status embeds ────────────────────────────────────────────────────────
 
     async def _refresh_status_embeds(
         self,
@@ -369,7 +439,7 @@ class NodeMonitorTask(commands.Cog):
             except Exception as exc:
                 log.error("Failed to update status embed node=%d: %s", nid, exc)
 
-    # ── Uptime embeds ──────────────────────────────────────────────────────────
+    # ── Uptime embeds ────────────────────────────────────────────────────────
 
     async def _refresh_uptime_embeds(
         self,
@@ -412,7 +482,6 @@ class NodeMonitorTask(commands.Cog):
         for node in nodes:
             nid = node["id"]
             now_online = online_map.get(nid, False)
-            # Default to True on first poll so we don't immediately fire "offline" for every node
             was_online = _node_was_online.get(nid, True)
 
             if now_online:
@@ -420,7 +489,7 @@ class NodeMonitorTask(commands.Cog):
                 if was_online:
                     await db.touch_node_online(nid, node["name"])
                 else:
-                    # Came back online
+                    # Came back online (recovery)
                     log.info("Node %s (%d) came ONLINE", node["name"], nid)
                     await db.mark_node_online(nid, node["name"])
                     duration = await db.close_downtime(nid) or 0
@@ -449,7 +518,7 @@ class NodeMonitorTask(commands.Cog):
 
             _node_was_online[nid] = now_online
 
-    # ── Alert senders ──────────────────────────────────────────────────────────
+    # ── Alert senders ────────────────────────────────────────────────────────
 
     async def _send_maintenance_alert(
         self, node: dict, maintenance_channels: list
@@ -493,7 +562,7 @@ class NodeMonitorTask(commands.Cog):
             except Exception as exc:
                 log.error("Failed to send recovery alert ch=%d: %s", channel_id, exc)
 
-    # ── Log helper ─────────────────────────────────────────────────────────────
+    # ── Log helper ─────────────────────────────────────────────────────────
 
     async def _send_log(self, action: str, details: str) -> None:
         log_channel_id = await self.bot.db.get_log_channel()
@@ -516,7 +585,7 @@ class NodeMonitorTask(commands.Cog):
         except Exception as exc:
             log.error("Failed to send log embed: %s", exc)
 
-    # ── Public API ─────────────────────────────────────────────────────────────
+    # ── Public API ─────────────────────────────────────────────────────────
 
     def restart(self) -> None:
         global _state_loaded
